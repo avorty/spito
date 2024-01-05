@@ -1,28 +1,60 @@
 package vrctFs
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"gopkg.in/mgo.v2/bson"
 	"os"
-	"slices"
+	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 )
 
-const VIRTUAL_FS_PATH_PREFIX = "/tmp/spito-vrct/fs"
+const VirtualFsPathPrefix = "/tmp/spito-vrct/fs"
+const VirtualFilePostfix = ".prototype.bson"
+
+var (
+	ErrConfigsCannotBeMerged = errors.New("configuration layers cannot be merged")
+)
 
 type FsVRCT struct {
 	virtualFSPath  string
 	fsRequirements []FsRequirement
 }
 
+type FsRequirement struct {
+	// In simpler words - how this rule appeared here
+	ruleStackTrace   []string
+	required         map[string]string
+	abandoned        map[string]string
+	checkRequirement func() bool
+}
+
+type FilePrototype struct {
+	Layers         []PrototypeLayer
+	RealFileExists bool
+	FileType       int
+	Path           string `bson:"-"`
+	Name           string `bson:"-"`
+}
+
+type PrototypeLayer struct {
+	// If content path is specified and file exists in real fs, real file will be later overridden by this content
+	// (We don't store content as string in order to make bson lightweight and fast accessible)
+	ContentPath string `bson:",omitempty"`
+	IsOptional  bool
+	// TODO: stack trace
+}
+
 func NewFsVRCT() (FsVRCT, error) {
-	err := os.MkdirAll(VIRTUAL_FS_PATH_PREFIX, os.ModePerm)
+	err := os.MkdirAll(VirtualFsPathPrefix, os.ModePerm)
 	if err != nil {
 		return FsVRCT{}, err
 	}
 
-	dir, err := os.MkdirTemp(VIRTUAL_FS_PATH_PREFIX, "")
+	dir, err := os.MkdirTemp(VirtualFsPathPrefix, "")
 	if err != nil {
 		return FsVRCT{}, err
 	}
@@ -128,7 +160,7 @@ func mergePrototypes(prototypesDirPath, destPath string) error {
 			fileName := strings.ReplaceAll(prototypeName, ".prototype.bson", "")
 
 			prototype := FilePrototype{}
-			if err := prototype.Read(prototypesDirPath + "/" + prototypeName); err != nil {
+			if err := prototype.Read(prototypesDirPath+"/", fileName); err != nil {
 				return err
 			}
 			file, err := prototype.SimulateFile()
@@ -141,140 +173,156 @@ func mergePrototypes(prototypesDirPath, destPath string) error {
 			}
 			continue
 		}
-		fmt.Printf("[WARNING] Unrecognized file %s in %s\n", prototypeName, prototypesDirPath)
+		//fmt.Printf("[WARNING] Unrecognized file %s in %s\n", prototypeName, prototypesDirPath)
 	}
 
 	return nil
 }
 
-type FsRequirement struct {
-	// In simpler words - how this rule appeared here
-	ruleStackTrace   []string
-	checkRequirement func() bool
+func (p *FilePrototype) mergeLayers() (PrototypeLayer, error) {
+	switch p.FileType {
+	case TextFile:
+		return p.mergeTextLayers()
+	default:
+		return p.mergeConfigLayers()
+	}
 }
 
-const (
-	ConfigFile = iota
-	TextFile
-)
-
-type FilePrototype struct {
-	Layers         []PrototypeLayer
-	RealFileExists bool
-	FileType       *int
-	SelfPath       string `bson:"-"`
-}
-
-type PrototypeLayer struct {
-	// If content path is specified and file exists in real fs, real file will be later overridden by this content
-	// (We don't store content as string in order to make bson lightweight and fast accessible)
-	ContentPath   *string `bson:",omitempty"`
-	IsOptional    bool
-	ConfigOptions []ConfigOption `bson:",omitempty"`
-	ConfigType    *int           `bson:",omitempty"`
-	// TODO: stack trace
-}
-
-func (p *FilePrototype) mergeLayers(optLayersIndexesToSkip []int) (PrototypeLayer, error) {
-	pl := PrototypeLayer{
+func (p *FilePrototype) mergeTextLayers() (PrototypeLayer, error) {
+	finalLayer := PrototypeLayer{
 		IsOptional: false,
 	}
 
-	encounteredOptionalLayers := 0
-
-	for i, layer := range p.Layers {
-		if layer.IsOptional {
-			encounteredOptionalLayers++
-			if slices.Contains(optLayersIndexesToSkip, encounteredOptionalLayers-1) {
-				continue
-			}
-		}
-
-		var optionalInfoPrefix string
-		if layer.IsOptional {
-			optionalInfoPrefix = "optional"
-		} else {
-			optionalInfoPrefix = "non optional"
-		}
-		potentialConflictError := fmt.Errorf(
-			"%s layer nr. %d is in conflict with previous layers", optionalInfoPrefix, i,
-		)
-
-		pl.ConfigOptions = append(pl.ConfigOptions, layer.ConfigOptions...)
-		pl.IsOptional = layer.IsOptional && pl.IsOptional
-
-		if pl.ConfigType != nil && layer.ConfigType != nil {
-			return pl, potentialConflictError
-		}
-		pl.ConfigType = layer.ConfigType
-	}
-
-	// Not optional layers first
 	sort.Slice(p.Layers, func(i, j int) bool {
 		return !p.Layers[i].IsOptional && p.Layers[j].IsOptional
 	})
 
 	for i, layer := range p.Layers {
-		if pl.ContentPath != nil && layer.ContentPath != nil && !layer.IsOptional {
-			return pl, fmt.Errorf(
+		// TODO: check if contents differ
+		if finalLayer.ContentPath != "" && layer.ContentPath != "" && !layer.IsOptional {
+			return finalLayer, fmt.Errorf(
 				"non optional layer nr. %d is in conflict with previous layers", i,
 			)
 		}
-		if (layer.IsOptional && pl.ContentPath == nil) || !layer.IsOptional {
-			pl.ContentPath = layer.ContentPath
+		if (layer.IsOptional && finalLayer.ContentPath == "") || !layer.IsOptional {
+			finalLayer.ContentPath = layer.ContentPath
 		}
 	}
 
-	return pl, nil
+	return finalLayer, nil
 }
 
+func (p *FilePrototype) mergeConfigLayers() (PrototypeLayer, error) {
+	// create new layer first
+	finalLayer, err := p.CreateLayer(nil, false)
+	if err != nil {
+		return finalLayer, err
+	}
+	finalLayerRawContent, err := finalLayer.GetContent()
+	if err != nil {
+		return finalLayer, err
+	}
+
+	var finalLayerContent map[string]interface{}
+	err = bson.Unmarshal(finalLayerRawContent, &finalLayerContent)
+	if err != nil {
+		return finalLayer, err
+	}
+
+	sort.Slice(p.Layers, func(i, j int) bool {
+		return !p.Layers[i].IsOptional && p.Layers[j].IsOptional
+	})
+
+	for _, layer := range p.Layers {
+		// TODO: check if contents differ
+		currentLayerRawContent, err := layer.GetContent()
+		if err != nil {
+			return finalLayer, err
+		}
+
+		var currentLayerContent map[string]interface{}
+		err = bson.Unmarshal(currentLayerRawContent, &currentLayerContent)
+		if err != nil {
+			return finalLayer, err
+		}
+
+		finalLayerContent, err = mergeConfigs(finalLayerContent, currentLayerContent, layer.IsOptional)
+		if err != nil {
+			return finalLayer, err
+		}
+	}
+
+	return finalLayer, nil
+}
+
+func mergeConfigs(merger map[string]interface{}, toMerge map[string]interface{}, isOptional bool) (map[string]interface{}, error) {
+	var err error
+	for key, toMergeVal := range toMerge {
+		// TODO: obtain which keys should be overridden and think of good priority and merging system
+		if mergerVal, ok := merger[key]; ok == true {
+			if reflect.ValueOf(toMergeVal).Kind() == reflect.Map {
+				toMergeMapVal := toMergeVal.(map[string]interface{})
+				mergerMapVal := mergerVal.(map[string]interface{})
+
+				merger[key], err = mergeConfigs(toMergeMapVal, mergerMapVal, isOptional)
+				if err != nil {
+					return merger, err
+				}
+			} else if !isOptional {
+				fmt.Printf("%s = '%s' %t", key, mergerVal, ok)
+				return merger, ErrConfigsCannotBeMerged
+			}
+		} else {
+			merger[key] = toMergeVal
+		}
+	}
+	return merger, nil
+}
+
+// TODO: fix this bro (it does nothing) and rename it to getRealParh
 func (p *FilePrototype) getDestinationPath() string {
-	splitPath := strings.Split(p.SelfPath, "/")
+	splitPath := strings.Split(p.getVirtualPath(), "/")
 	return strings.Join(splitPath[:len(splitPath)-1], "/")
 }
 
+func (p *FilePrototype) getVirtualPath() string {
+	return p.Path + p.Name + VirtualFilePostfix
+}
+
 func (p *FilePrototype) SimulateFile() ([]byte, error) {
-	finalLayer, err := p.mergeLayers([]int{})
+	finalLayer, err := p.mergeLayers()
+
 	if err != nil {
 		return nil, err
 	}
 
-	var fileType int
-	if p.FileType == nil {
-		fileType = TextFile
+	var filePath string
+
+	if p.RealFileExists {
+		filePath = p.getDestinationPath()
 	} else {
-		fileType = *p.FileType
+		filePath = finalLayer.ContentPath
 	}
 
-	switch fileType {
-	case TextFile:
-		var filePath string
-
-		if p.RealFileExists {
-			filePath = p.getDestinationPath()
-		} else {
-			filePath = *finalLayer.ContentPath
-		}
-
-		file, err := os.ReadFile(filePath)
-		if err != nil {
-			return nil, err
-		}
-
-		return file, nil
-
-	case ConfigFile:
-		// TODO
-		break
+	file, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
 	}
 
-	// Todo: handle other FileTypes
-	panic("Unimplemented FileType simulation")
+	return file, nil
 }
 
-func (p *FilePrototype) Read(prototypePath string) error {
-	p.SelfPath = prototypePath
-	file, err := os.ReadFile(prototypePath)
+// TODO: think of splitting it up into to functions (read and load)
+func (p *FilePrototype) Read(vrctPrefix string, realPath string) error {
+	prototypeFilePath := vrctPrefix + realPath
+
+	pathEnd := strings.LastIndex(prototypeFilePath, "/") + 1
+	path := prototypeFilePath[0:pathEnd]
+	name := prototypeFilePath[pathEnd:]
+
+	p.Path = path
+	p.Name = name
+	file, err := os.ReadFile(p.getVirtualPath())
 
 	if os.IsNotExist(err) {
 		return p.Save()
@@ -284,7 +332,9 @@ func (p *FilePrototype) Read(prototypePath string) error {
 
 	err = bson.Unmarshal(file, p)
 
-	p.SelfPath = prototypePath
+	// TODO: think about it (sus)
+	p.Path = path
+	p.Name = name
 	return err
 }
 
@@ -294,14 +344,82 @@ func (p *FilePrototype) Save() error {
 		return err
 	}
 
-	return os.WriteFile(p.SelfPath, rawBson, os.ModePerm)
+	return os.WriteFile(p.getVirtualPath(), rawBson, os.ModePerm)
+}
+
+func (p *FilePrototype) CreateLayer(content []byte, isOptional bool) (PrototypeLayer, error) {
+	if p.Path == "" {
+		return PrototypeLayer{}, errors.New("file prototype hasn't been loaded yet")
+	}
+
+	// TODO: check if file with random name already exist
+	var contentPath string
+
+	randFileName := randomLetters(5)
+	dir := filepath.Dir(p.Path)
+	contentPath = fmt.Sprintf("%s/%s", dir, randFileName)
+
+	var tempConvertedContent map[string]interface{}
+	var err error
+
+	switch p.FileType {
+	case JsonConfig:
+
+		if content == nil {
+			content = []byte("{}")
+		}
+		err = json.Unmarshal(content, &tempConvertedContent)
+		if err != nil {
+			return PrototypeLayer{}, err
+		}
+
+		//case YamlConfig:
+		//	content, err = yaml.Marshal(content)
+		//	if err != nil {
+		//		return PrototypeLayer{}, err
+		//	}
+		break
+	case TextFile:
+		break
+	default:
+		return PrototypeLayer{}, fmt.Errorf("unsupported config type (FileType argument), passed '%d'", p.FileType)
+	}
+
+	if p.FileType != TextFile && tempConvertedContent != nil {
+		content, err = bson.Marshal(tempConvertedContent)
+		if err != nil {
+			return PrototypeLayer{}, err
+		}
+	}
+
+	// TODO: think about changing ModePerm (spito can be run as root (dangerous))
+	if err = os.WriteFile(contentPath, content, os.ModePerm); err != nil {
+		return PrototypeLayer{}, err
+	}
+
+	newLayer := PrototypeLayer{
+		ContentPath: contentPath,
+		IsOptional:  isOptional,
+	}
+
+	return newLayer, nil
 }
 
 func (p *FilePrototype) AddNewLayer(layer PrototypeLayer) error {
+	// TODO: merge first and check if new layers is addable
 	p.Layers = append(p.Layers, layer)
 	if err := p.Save(); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+func (layer *PrototypeLayer) GetContent() ([]byte, error) {
+	file, err := os.ReadFile(layer.ContentPath)
+	if err != nil {
+		return file, err
+	}
+
+	return file, nil
 }
